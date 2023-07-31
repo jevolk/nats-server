@@ -1774,13 +1774,10 @@ func TestSystemAccountNoAuthUser(t *testing.T) {
 }
 
 func TestServerAccountConns(t *testing.T) {
-	// speed up hb
-	orgHBInterval := eventsHBInterval
-	eventsHBInterval = time.Millisecond * 100
-	defer func() { eventsHBInterval = orgHBInterval }()
 	conf := createConfFile(t, []byte(`
 	   host: 127.0.0.1
 	   port: -1
+	   hb_interval: 100ms # speed up hb
 	   system_account: SYS
 	   accounts: {
 			   SYS: {users: [{user: s, password: s}]}
@@ -2293,11 +2290,10 @@ func (sr *slowAccResolver) Fetch(name string) (string, error) {
 }
 
 func TestConnectionUpdatesTimerProperlySet(t *testing.T) {
-	origEventsHBInterval := eventsHBInterval
-	eventsHBInterval = 50 * time.Millisecond
-	defer func() { eventsHBInterval = origEventsHBInterval }()
-
 	sa, _, sb, optsB, _ := runTrustedCluster(t)
+	sa.opts.HBInterval = 50 * time.Millisecond
+	sb.opts.HBInterval = sa.opts.HBInterval
+
 	defer sa.Shutdown()
 	defer sb.Shutdown()
 

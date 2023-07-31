@@ -6154,12 +6154,13 @@ func TestJetStreamClusterStreamCatchupWithTruncateAndPriorSnapshot(t *testing.T)
 }
 
 func TestJetStreamClusterNoOrphanedDueToNoConnection(t *testing.T) {
-	orgEventsHBInterval := eventsHBInterval
-	eventsHBInterval = 500 * time.Millisecond
-	defer func() { eventsHBInterval = orgEventsHBInterval }()
-
 	c := createJetStreamClusterExplicit(t, "R3F", 3)
 	defer c.shutdown()
+
+	// Speed up HB
+	for _, s := range c.servers {
+		s.opts.HBInterval = 500 * time.Millisecond
+	}
 
 	s := c.randomServer()
 	nc, js := jsClientConnect(t, s)
@@ -6191,9 +6192,9 @@ func TestJetStreamClusterNoOrphanedDueToNoConnection(t *testing.T) {
 	nc.Close()
 
 	s.mu.RLock()
-	val := (s.sys.orphMax / eventsHBInterval) + 2
+	val := (s.sys.orphMax / s.opts.HBInterval) + 2
 	s.mu.RUnlock()
-	time.Sleep(val * eventsHBInterval)
+	time.Sleep(val * s.opts.HBInterval)
 	checkSysServers()
 }
 
