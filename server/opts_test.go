@@ -99,6 +99,7 @@ func TestConfigFile(t *testing.T) {
 		Username:              "derek",
 		Password:              "porkchop",
 		AuthTimeout:           1.0,
+		NoLog:                 false,
 		Debug:                 false,
 		Trace:                 true,
 		Logtime:               false,
@@ -258,6 +259,7 @@ func TestMergeOverrides(t *testing.T) {
 		Username:       "derek",
 		Password:       "porkchop",
 		AuthTimeout:    1.0,
+		NoLog:          true,
 		Debug:          true,
 		Trace:          true,
 		Logtime:        false,
@@ -292,6 +294,7 @@ func TestMergeOverrides(t *testing.T) {
 	opts := &Options{
 		Port:         2222,
 		Password:     "porkchop",
+		NoLog:        true,
 		Debug:        true,
 		HTTPPort:     DEFAULT_HTTP_PORT,
 		HTTPBasePath: DEFAULT_HTTP_BASE_PATH,
@@ -1239,6 +1242,7 @@ func TestOptionsClone(t *testing.T) {
 		Username:       "derek",
 		Password:       "porkchop",
 		AuthTimeout:    1.0,
+		NoLog:          true,
 		Debug:          true,
 		Trace:          true,
 		Logtime:        false,
@@ -1383,11 +1387,12 @@ func TestPingIntervalNew(t *testing.T) {
 }
 
 func TestOptionsProcessConfigFile(t *testing.T) {
-	// Create options with default values of Debug and Trace
+	// Create options with default values of NoLog, Debug and Trace
 	// that are the opposite of what is in the config file.
 	// Set another option that is not present in the config file.
 	logFileName := "test.log"
 	opts := &Options{
+		NoLog:   true, // Quiet
 		Debug:   true,
 		Trace:   false,
 		LogFile: logFileName,
@@ -1399,6 +1404,9 @@ func TestOptionsProcessConfigFile(t *testing.T) {
 	// Verify that values are as expected
 	if opts.ConfigFile != configFileName {
 		t.Fatalf("Expected ConfigFile to be set to %q, got %v", configFileName, opts.ConfigFile)
+	}
+	if opts.NoLog {
+		t.Fatal("Quiet option should have been set to false from config file")
 	}
 	if opts.Debug {
 		t.Fatal("Debug option should have been set to false from config file")
@@ -1500,6 +1508,18 @@ func TestConfigureOptions(t *testing.T) {
 	// Should fail because of invalid pid
 	// On windows, if not running with admin privileges, you would get access denied.
 	expectToFail([]string{"-sl", "quit=pid"}, "pid", "denied")
+
+	// The config file set Quiet to true
+	opts = mustNotFail([]string{"-c", "./configs/test.conf", "-Q"})
+	if !opts.NoLog {
+		t.Fatal("Quiet should have been set to false")
+	}
+
+	// The config file set Quiet to true, but was overridden by param -Q=false
+	opts = mustNotFail([]string{"-c", "./configs/test.conf", "-Q=false"})
+	if opts.NoLog {
+		t.Fatal("Quiet should have been set to false")
+	}
 
 	// The config file set Trace to true.
 	opts = mustNotFail([]string{"-c", "./configs/test.conf"})

@@ -835,6 +835,9 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.ServerName = v.(string)
 	case "host", "net":
 		o.Host = v.(string)
+	case "quiet":
+		o.NoLog = v.(bool)
+		trackExplicitVal(o, &o.inConfig, "Quiet", o.NoLog)
 	case "debug":
 		o.Debug = v.(bool)
 		trackExplicitVal(o, &o.inConfig, "Debug", o.Debug)
@@ -4681,6 +4684,9 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	if flagOpts.HTTPBasePath != _EMPTY_ {
 		opts.HTTPBasePath = flagOpts.HTTPBasePath
 	}
+	if flagOpts.NoLog {
+		opts.NoLog = true
+	}
 	if flagOpts.Debug {
 		opts.Debug = true
 	}
@@ -5045,6 +5051,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.Host, "a", _EMPTY_, "Network host to listen on.")
 	fs.StringVar(&opts.Host, "net", _EMPTY_, "Network host to listen on.")
 	fs.StringVar(&opts.ClientAdvertise, "client_advertise", _EMPTY_, "Client URL to advertise to other servers.")
+	fs.BoolVar(&opts.NoLog, "Q", false, "Disable logging.")
+	fs.BoolVar(&opts.NoLog, "quiet", false, "Disable logging.")
 	fs.BoolVar(&opts.Debug, "D", false, "Enable Debug logging.")
 	fs.BoolVar(&opts.Debug, "debug", false, "Enable Debug logging.")
 	fs.BoolVar(&opts.Trace, "V", false, "Enable Trace logging.")
@@ -5173,6 +5181,10 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Syslog", FlagSnapshot.Syslog)
 		case "no_advertise":
 			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Cluster.NoAdvertise", FlagSnapshot.Cluster.NoAdvertise)
+		case "Q":
+			fallthrough
+		case "quiet":
+			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Quiet", FlagSnapshot.NoLog)
 		}
 	})
 

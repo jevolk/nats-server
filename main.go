@@ -47,6 +47,7 @@ Logging Options:
     -T, --logtime                    Timestamp log entries (default: true)
     -s, --syslog                     Log to syslog or windows event log
     -r, --remote_syslog <addr>       Syslog server addr (udp://localhost:514)
+    -Q, --quiet                      Disable logging
     -D, --debug                      Enable debugging output
     -V, --trace                      Trace the raw protocol
     -VV                              Verbose trace (traces system account as well)
