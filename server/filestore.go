@@ -174,6 +174,7 @@ type fileStore struct {
 	hh          hash.Hash64
 	qch         chan struct{}
 	cfs         []ConsumerStore
+	lfd         *os.File
 	sips        int
 	closed      bool
 	fip         bool
@@ -385,6 +386,10 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		prf:    prf,
 		oldprf: oldprf,
 		qch:    make(chan struct{}),
+	}
+
+	if err := fs.lockFileSystem(); err != nil {
+		return nil, err
 	}
 
 	// Set flush in place to AsyncFlush which by default is false.
