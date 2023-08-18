@@ -7024,3 +7024,58 @@ func TestLeafNodeSameLocalAccountToMultipleHubs(t *testing.T) {
 	natsPub(t, nch2, "C", []byte("msgC2"))
 	checkNoMsg(subc)
 }
+
+func TestLeafNodeSlowConsumer(t *testing.T) {
+	ao := DefaultOptions()
+	ao.LeafNode.Host = "127.0.0.1"
+	ao.LeafNode.Port = -1
+	ao.WriteDeadline = 1 * time.Millisecond
+	a := RunServer(ao)
+	defer a.Shutdown()
+
+	c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", ao.LeafNode.Port))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	a.mu.Lock()
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		a.grMu.Lock()
+		defer a.grMu.Unlock()
+		for _, cli := range a.grTmpClients {
+			cli.out.wdl = time.Nanosecond
+			return nil
+		}
+		return nil
+	})
+	a.mu.Unlock()
+
+	// Only leafnode slow consumers that made it past connect are tracked
+	// in the slow consumers counter.
+	if _, err := c.Write([]byte("CONNECT {}\r\n")); err != nil {
+		t.Fatalf("Error writing connect: %v", err)
+	}
+	// Read info
+	br := bufio.NewReader(c)
+	br.ReadLine()
+	for i := 0; i < 10; i++ {
+		if _, err := c.Write([]byte("PING\r\n")); err != nil {
+			t.Fatalf("Unexpected error writing PING: %v", err)
+		}
+	}
+	defer c.Close()
+	timeout := time.Now().Add(time.Second)
+	var (
+		got      uint64
+		expected uint64 = 1
+	)
+	for time.Now().Before(timeout) {
+		got = a.NumSlowConsumersLeafs()
+		if got == expected {
+			return
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	t.Fatalf("Timed out waiting for slow consumer leafnodes, got: %v, expected: %v", got, expected)
+
+}

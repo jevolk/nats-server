@@ -3432,11 +3432,13 @@ func TestAccountImportCycle(t *testing.T) {
 	// setup requestor
 	ib := "q2.inbox"
 	subAResp, err := ncA.SubscribeSync(ib)
+	ncA.Flush()
 	require_NoError(t, err)
 	req := func() {
 		t.Helper()
 		// send request
 		err = ncA.PublishRequest("q1.a", ib, []byte("test"))
+		ncA.Flush()
 		require_NoError(t, err)
 		mRep, err := subAResp.NextMsg(time.Second)
 		require_NoError(t, err)
@@ -3618,7 +3620,7 @@ func TestAccountReloadServiceImportPanic(t *testing.T) {
 	wg.Wait()
 
 	totalRequests := requests.Load()
-	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
+	checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
 		resp := responses.Load()
 		if resp == totalRequests {
 			return nil

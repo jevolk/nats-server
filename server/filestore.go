@@ -174,6 +174,7 @@ type fileStore struct {
 	hh          hash.Hash64
 	qch         chan struct{}
 	cfs         []ConsumerStore
+	lfd         *os.File
 	sips        int
 	closed      bool
 	fip         bool
@@ -385,6 +386,10 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		prf:    prf,
 		oldprf: oldprf,
 		qch:    make(chan struct{}),
+	}
+
+	if err := fs.lockFileSystem(); err != nil {
+		return nil, err
 	}
 
 	// Set flush in place to AsyncFlush which by default is false.
@@ -5708,13 +5713,13 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 
 	var purged, bytes uint64
 
-	// We have to delete interior messages.
 	fs.mu.Lock()
+	// Same as purge all.
 	if lseq := fs.state.LastSeq; seq > lseq {
 		fs.mu.Unlock()
 		return fs.purge(seq)
 	}
-
+	// We have to delete interior messages.
 	smb := fs.selectMsgBlock(seq)
 	if smb == nil {
 		fs.mu.Unlock()
@@ -6633,6 +6638,9 @@ func (fs *fileStore) Stop() error {
 	fs.cancelSyncTimer()
 	fs.cancelAgeChk()
 
+	// We should update the upper usage layer on a stop.
+	cb, bytes := fs.scb, int64(fs.state.Bytes)
+
 	var _cfs [256]ConsumerStore
 	cfs := append(_cfs[:0], fs.cfs...)
 	fs.cfs = nil
@@ -6640,6 +6648,10 @@ func (fs *fileStore) Stop() error {
 
 	for _, o := range cfs {
 		o.Stop()
+	}
+
+	if bytes > 0 && cb != nil {
+		cb(0, -bytes, 0, _EMPTY_)
 	}
 
 	return nil
@@ -6880,8 +6892,21 @@ func (fs *fileStore) fileStoreConfig() FileStoreConfig {
 	return fs.fcfg
 }
 
-// When we will write a run length encoded record vs adding to the existing avl.SequenceSet.
-const rlThresh = 4096
+// Read lock all existing message blocks.
+// Lock held on entry.
+func (fs *fileStore) readLockAllMsgBlocks() {
+	for _, mb := range fs.blks {
+		mb.mu.RLock()
+	}
+}
+
+// Read unlock all existing message blocks.
+// Lock held on entry.
+func (fs *fileStore) readUnlockAllMsgBlocks() {
+	for _, mb := range fs.blks {
+		mb.mu.RUnlock()
+	}
+}
 
 // Binary encoded state snapshot, >= v2.10 server.
 func (fs *fileStore) EncodedStreamState(failed uint64) ([]byte, error) {
@@ -6912,6 +6937,10 @@ func (fs *fileStore) EncodedStreamState(failed uint64) ([]byte, error) {
 
 	if numDeleted > 0 {
 		var scratch [4 * 1024]byte
+
+		fs.readLockAllMsgBlocks()
+		defer fs.readUnlockAllMsgBlocks()
+
 		for _, db := range fs.deleteBlocks() {
 			switch db := db.(type) {
 			case *DeleteRange:
@@ -6936,68 +6965,23 @@ func (fs *fileStore) EncodedStreamState(failed uint64) ([]byte, error) {
 	return b, nil
 }
 
-// Lock should be held.
+// We used to be more sophisticated to save memory, but speed is more important.
+// All blocks should be at least read locked.
 func (fs *fileStore) deleteBlocks() DeleteBlocks {
-	var (
-		dbs      DeleteBlocks
-		adm      *avl.SequenceSet
-		prevLast uint64
-	)
+	var dbs DeleteBlocks
+	var prevLast uint64
+
 	for _, mb := range fs.blks {
-		mb.mu.RLock()
 		// Detect if we have a gap between these blocks.
 		if prevLast > 0 && prevLast+1 != mb.first.seq {
-			// Detect if we need to encode a run length encoding here.
-			if gap := mb.first.seq - prevLast - 1; gap > rlThresh {
-				// Check if we have a running adm, if so write that out first, or if contigous update rle params.
-				if min, max, num := adm.State(); num > 0 {
-					// Check if we are all contingous.
-					if num == max-min+1 {
-						prevLast, gap = min-1, mb.first.seq-min
-					} else {
-						dbs = append(dbs, adm)
-					}
-					// Always nil out here.
-					adm = nil
-				}
-				dbs = append(dbs, &DeleteRange{First: prevLast + 1, Num: gap})
-			} else {
-				// Common dmap
-				if adm == nil {
-					adm = &avl.SequenceSet{}
-					adm.SetInitialMin(prevLast + 1)
-				}
-				for seq := prevLast + 1; seq < mb.first.seq; seq++ {
-					adm.Insert(seq)
-				}
-			}
+			gap := mb.first.seq - prevLast - 1
+			dbs = append(dbs, &DeleteRange{First: prevLast + 1, Num: gap})
 		}
-		if min, max, num := mb.dmap.State(); num > 0 {
-			// Check in case the mb's dmap is contiguous and over our threshold.
-			if num == max-min+1 && num > rlThresh {
-				// Need to write out adm if it exists.
-				if adm != nil && adm.Size() > 0 {
-					dbs = append(dbs, adm)
-					adm = nil
-				}
-				dbs = append(dbs, &DeleteRange{First: min, Num: max - min + 1})
-			} else {
-				// Aggregated dmap
-				if adm == nil {
-					adm = mb.dmap.Clone()
-				} else {
-					adm.Union(&mb.dmap)
-				}
-			}
+		if mb.dmap.Size() > 0 {
+			dbs = append(dbs, &mb.dmap)
 		}
 		prevLast = mb.last.seq
-		mb.mu.RUnlock()
 	}
-
-	if adm != nil {
-		dbs = append(dbs, adm)
-	}
-
 	return dbs
 }
 
@@ -7006,9 +6990,13 @@ func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) {
 	if len(dbs) == 0 {
 		return
 	}
+
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
+	var needsCheck DeleteBlocks
+
+	fs.readLockAllMsgBlocks()
 	mdbs := fs.deleteBlocks()
 	for i, db := range dbs {
 		// If the block is same as what we have we can skip.
@@ -7020,6 +7008,11 @@ func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) {
 			}
 		}
 		// Need to insert these.
+		needsCheck = append(needsCheck, db)
+	}
+	fs.readUnlockAllMsgBlocks()
+
+	for _, db := range needsCheck {
 		db.Range(func(dseq uint64) bool {
 			fs.removeMsg(dseq, false, true, false)
 			return true

@@ -1,4 +1,4 @@
-// Copyright 2012-2022 The NATS Authors
+// Copyright 2012-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -35,6 +35,7 @@ import (
 
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats-server/v2/conf"
+	"github.com/nats-io/nats-server/v2/server/certidp"
 	"github.com/nats-io/nats-server/v2/server/certstore"
 	"github.com/nats-io/nkeys"
 )
@@ -387,6 +388,9 @@ type Options struct {
 	// JetStream
 	maxMemSet   bool
 	maxStoreSet bool
+
+	// OCSP Cache config enables next-gen cache for OCSP features
+	OCSPCacheConfig *OCSPResponseCacheConfig
 }
 
 // WebsocketOpts are options for websocket
@@ -450,6 +454,9 @@ type WebsocketOpts struct {
 	// and write the response back to the client. This include the
 	// time needed for the TLS Handshake.
 	HandshakeTimeout time.Duration
+
+	// Snapshot of configured TLS options.
+	tlsConfigOpts *TLSConfigOpts
 }
 
 // MQTTOpts are options for MQTT
@@ -530,6 +537,9 @@ type MQTTOpts struct {
 	// subscription ending with "#" will use 2 times the MaxAckPending value.
 	// Note that changes to this option is applied only to new subscriptions.
 	MaxAckPending uint16
+
+	// Snapshot of configured TLS options.
+	tlsConfigOpts *TLSConfigOpts
 }
 
 type netResolver interface {
@@ -627,6 +637,7 @@ type TLSConfigOpts struct {
 	CertStore         certstore.StoreType
 	CertMatchBy       certstore.MatchByType
 	CertMatch         string
+	OCSPPeerConfig    *certidp.OCSPPeerConfig
 }
 
 // OCSPConfig represents the options of OCSP stapling options.
@@ -825,6 +836,9 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.ServerName = v.(string)
 	case "host", "net":
 		o.Host = v.(string)
+	case "quiet":
+		o.NoLog = v.(bool)
+		trackExplicitVal(o, &o.inConfig, "Quiet", o.NoLog)
 	case "debug":
 		o.Debug = v.(bool)
 		trackExplicitVal(o, &o.inConfig, "Debug", o.Debug)
@@ -1239,17 +1253,22 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 				*errors = append(*errors, &configErr{tk, err.Error()})
 				return
 			}
-			if dir == _EMPTY_ {
-				*errors = append(*errors, &configErr{tk, "dir has no value and needs to point to a directory"})
-				return
+
+			checkDir := func() {
+				if dir == _EMPTY_ {
+					*errors = append(*errors, &configErr{tk, "dir has no value and needs to point to a directory"})
+					return
+				}
+				if info, _ := os.Stat(dir); info != nil && (!info.IsDir() || info.Mode().Perm()&(1<<(uint(7))) == 0) {
+					*errors = append(*errors, &configErr{tk, "dir needs to point to an accessible directory"})
+					return
+				}
 			}
-			if info, _ := os.Stat(dir); info != nil && (!info.IsDir() || info.Mode().Perm()&(1<<(uint(7))) == 0) {
-				*errors = append(*errors, &configErr{tk, "dir needs to point to an accessible directory"})
-				return
-			}
+
 			var res AccountResolver
 			switch strings.ToUpper(dirType) {
 			case "CACHE":
+				checkDir()
 				if sync != 0 {
 					*errors = append(*errors, &configErr{tk, "CACHE does not accept sync"})
 				}
@@ -1261,6 +1280,7 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 				}
 				res, err = NewCacheDirAccResolver(dir, limit, ttl, opts...)
 			case "FULL":
+				checkDir()
 				if ttl != 0 {
 					*errors = append(*errors, &configErr{tk, "FULL does not accept ttl"})
 				}
@@ -1276,6 +1296,8 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 					}
 				}
 				res, err = NewDirAccResolver(dir, limit, sync, delete, opts...)
+			case "MEM", "MEMORY":
+				res = &MemAccResolver{}
 			}
 			if err != nil {
 				*errors = append(*errors, &configErr{tk, err.Error()})
@@ -1453,6 +1475,34 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 			m[kk] = v.(string)
 		}
 		o.JsAccDefaultDomain = m
+	case "ocsp_cache":
+		var err error
+		switch vv := v.(type) {
+		case bool:
+			pc := NewOCSPResponseCacheConfig()
+			if vv {
+				// Set enabled
+				pc.Type = LOCAL
+				o.OCSPCacheConfig = pc
+			} else {
+				// Set disabled (none cache)
+				pc.Type = NONE
+				o.OCSPCacheConfig = pc
+			}
+		case map[string]interface{}:
+			pc, err := parseOCSPResponseCache(v)
+			if err != nil {
+				*errors = append(*errors, err)
+				return
+			}
+			o.OCSPCacheConfig = pc
+		default:
+			err = &configErr{tk, fmt.Sprintf("error parsing tags: unsupported type %T", v)}
+		}
+		if err != nil {
+			*errors = append(*errors, err)
+			return
+		}
 	default:
 		if au := atomic.LoadInt32(&allowUnknownTopLevelField); au == 0 && !tk.IsUsedVariable() {
 			err := &unknownConfigFieldErr{
@@ -4054,8 +4104,10 @@ func PrintTLSHelpAndDie() {
 		fmt.Printf("    %s\n", k)
 	}
 	if runtime.GOOS == "windows" {
-		fmt.Printf("%s", certstore.Usage)
+		fmt.Printf("%s\n", certstore.Usage)
 	}
+	fmt.Printf("%s", certidp.OCSPPeerUsage)
+	fmt.Printf("%s", OCSPResponseCacheUsage)
 	os.Exit(0)
 }
 
@@ -4241,6 +4293,28 @@ func parseTLS(v interface{}, isClientCtx bool) (t *TLSConfigOpts, retErr error) 
 			tc.CertMatch = certMatch
 		case "handshake_first", "first", "immediate":
 			tc.HandshakeFirst = mv.(bool)
+		case "ocsp_peer":
+			switch vv := mv.(type) {
+			case bool:
+				pc := certidp.NewOCSPPeerConfig()
+				if vv {
+					// Set enabled
+					pc.Verify = true
+					tc.OCSPPeerConfig = pc
+				} else {
+					// Set disabled
+					pc.Verify = false
+					tc.OCSPPeerConfig = pc
+				}
+			case map[string]interface{}:
+				pc, err := parseOCSPPeer(mv)
+				if err != nil {
+					return nil, &configErr{tk, err.Error()}
+				}
+				tc.OCSPPeerConfig = pc
+			default:
+				return nil, &configErr{tk, fmt.Sprintf("error parsing ocsp peer config: unsupported type %T", v)}
+			}
 		default:
 			return nil, &configErr{tk, fmt.Sprintf("error parsing tls config, unknown field [%q]", mk)}
 		}
@@ -4371,6 +4445,7 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 			}
 			o.Websocket.TLSMap = tc.Map
 			o.Websocket.TLSPinnedCerts = tc.PinnedCerts
+			o.Websocket.tlsConfigOpts = tc
 		case "same_origin":
 			o.Websocket.SameOrigin = mv.(bool)
 		case "allowed_origins", "allowed_origin", "allow_origins", "allow_origin", "origins", "origin":
@@ -4461,6 +4536,7 @@ func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) er
 			o.MQTT.TLSTimeout = tc.Timeout
 			o.MQTT.TLSMap = tc.Map
 			o.MQTT.TLSPinnedCerts = tc.PinnedCerts
+			o.MQTT.tlsConfigOpts = tc
 		case "authorization", "authentication":
 			auth := parseSimpleAuth(tk, errors, warnings)
 			o.MQTT.Username = auth.user
@@ -4610,6 +4686,9 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	}
 	if flagOpts.HTTPBasePath != _EMPTY_ {
 		opts.HTTPBasePath = flagOpts.HTTPBasePath
+	}
+	if flagOpts.NoLog {
+		opts.NoLog = true
 	}
 	if flagOpts.Debug {
 		opts.Debug = true
@@ -4978,6 +5057,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.Host, "a", _EMPTY_, "Network host to listen on.")
 	fs.StringVar(&opts.Host, "net", _EMPTY_, "Network host to listen on.")
 	fs.StringVar(&opts.ClientAdvertise, "client_advertise", _EMPTY_, "Client URL to advertise to other servers.")
+	fs.BoolVar(&opts.NoLog, "Q", false, "Disable logging.")
+	fs.BoolVar(&opts.NoLog, "quiet", false, "Disable logging.")
 	fs.BoolVar(&opts.Debug, "D", false, "Enable Debug logging.")
 	fs.BoolVar(&opts.Debug, "debug", false, "Enable Debug logging.")
 	fs.BoolVar(&opts.Trace, "V", false, "Enable Trace logging.")
@@ -5106,6 +5187,10 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Syslog", FlagSnapshot.Syslog)
 		case "no_advertise":
 			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Cluster.NoAdvertise", FlagSnapshot.Cluster.NoAdvertise)
+		case "Q":
+			fallthrough
+		case "quiet":
+			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Quiet", FlagSnapshot.NoLog)
 		}
 	})
 

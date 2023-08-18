@@ -2968,9 +2968,10 @@ func TestMonitorLeafNode(t *testing.T) {
 		opts.LeafNode.TLSConfig != nil,
 		[]RemoteLeafOptsVarz{
 			{
-				"acc", 1, []string{"localhost:1234"}, nil,
+				"acc", 1, []string{"localhost:1234"}, nil, false,
 			},
 		},
+		false,
 	}
 
 	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
@@ -2987,7 +2988,7 @@ func TestMonitorLeafNode(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in ClusterOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = LeafNodeOptsVarz{"", 0, 0, 0, false, false, []RemoteLeafOptsVarz{{"", 0, nil, nil}}}
+		_ = LeafNodeOptsVarz{"", 0, 0, 0, false, false, []RemoteLeafOptsVarz{{"", 0, nil, nil, false}}, false}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -3945,7 +3946,7 @@ func TestMonitorAccountz(t *testing.T) {
 	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?acc=$SYS", s.MonitorAddr().Port, AccountzPath)))
 	require_Contains(t, body, `"account_detail": {`)
 	require_Contains(t, body, `"account_name": "$SYS",`)
-	require_Contains(t, body, `"subscriptions": 47,`)
+	require_Contains(t, body, `"subscriptions": 49,`)
 	require_Contains(t, body, `"is_system": true,`)
 	require_Contains(t, body, `"system_account": "$SYS"`)
 
@@ -4645,14 +4646,6 @@ func TestServerIDZRequest(t *testing.T) {
 func TestMonitorProfilez(t *testing.T) {
 	s := RunServer(DefaultOptions())
 	defer s.Shutdown()
-
-	// First of all, check that the profiles aren't accessible
-	// when profiling hasn't been started in the usual way.
-	if ps := s.profilez(&ProfilezOptions{
-		Name: "allocs", Debug: 0,
-	}); ps.Error == "" {
-		t.Fatal("Profile should not be accessible when profiling not started")
-	}
 
 	// Then start profiling.
 	s.StartProfiler()

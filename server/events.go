@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,7 +31,9 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/s2"
+
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats-server/v2/server/certidp"
 	"github.com/nats-io/nats-server/v2/server/pse"
 )
 
@@ -54,6 +57,8 @@ const (
 	accConnsEventSubjNew      = "$SYS.ACCOUNT.%s.SERVER.CONNS"
 	accConnsEventSubjOld      = "$SYS.SERVER.ACCOUNT.%s.CONNS" // kept for backward compatibility
 	shutdownEventSubj         = "$SYS.SERVER.%s.SHUTDOWN"
+	clientKickReqSubj         = "$SYS.REQ.SERVER.%s.KICK"
+	clientLDMReqSubj          = "$SYS.REQ.SERVER.%s.LDM"
 	authErrorEventSubj        = "$SYS.SERVER.%s.CLIENT.AUTH.ERR"
 	authErrorAccountEventSubj = "$SYS.ACCOUNT.CLIENT.AUTH.ERR"
 	serverStatsSubj           = "$SYS.SERVER.%s.STATSZ"
@@ -84,6 +89,9 @@ const (
 
 	accReqTokens   = 5
 	accReqAccIndex = 3
+
+	ocspPeerRejectEventSubj           = "$SYS.SERVER.%s.OCSP.PEER.CONN.REJECT"
+	ocspPeerChainlinkInvalidEventSubj = "$SYS.SERVER.%s.OCSP.PEER.LINK.INVALID"
 )
 
 type sysMsgHandler func(sub *subscription, client *client, acc *Account, subject, reply string, hdr, msg []byte)
@@ -154,6 +162,34 @@ type DisconnectEventMsg struct {
 // DisconnectEventMsgType is the schema type for DisconnectEventMsg
 const DisconnectEventMsgType = "io.nats.server.advisory.v1.client_disconnect"
 
+// OCSPPeerRejectEventMsg is sent when a peer TLS handshake is ultimately rejected due to OCSP invalidation.
+// A "peer" can be an inbound client connection or a leaf connection to a remote server. Peer in event payload
+// is always the peer's (TLS) leaf cert, which may or may be the invalid cert (See also OCSPPeerChainlinkInvalidEventMsg)
+type OCSPPeerRejectEventMsg struct {
+	TypedEvent
+	Kind   string           `json:"kind"`
+	Peer   certidp.CertInfo `json:"peer"`
+	Server ServerInfo       `json:"server"`
+	Reason string           `json:"reason"`
+}
+
+// OCSPPeerRejectEventMsgType is the schema type for OCSPPeerRejectEventMsg
+const OCSPPeerRejectEventMsgType = "io.nats.server.advisory.v1.ocsp_peer_reject"
+
+// OCSPPeerChainlinkInvalidEventMsg is sent when a certificate (link) in a valid TLS chain is found to be OCSP invalid
+// during a peer TLS handshake. A "peer" can be an inbound client connection or a leaf connection to a remote server.
+// Peer and Link may be the same if the invalid cert was the peer's leaf cert
+type OCSPPeerChainlinkInvalidEventMsg struct {
+	TypedEvent
+	Link   certidp.CertInfo `json:"link"`
+	Peer   certidp.CertInfo `json:"peer"`
+	Server ServerInfo       `json:"server"`
+	Reason string           `json:"reason"`
+}
+
+// OCSPPeerChainlinkInvalidEventMsgType is the schema type for OCSPPeerChainlinkInvalidEventMsg
+const OCSPPeerChainlinkInvalidEventMsgType = "io.nats.server.advisory.v1.ocsp_peer_link_invalid"
+
 // AccountNumConns is an event that will be sent from a server that is tracking
 // a given account when the number of connections changes. It will also HB
 // updates in the absence of any changes.
@@ -206,7 +242,7 @@ type ServerInfo struct {
 	// Whether JetStream is enabled (deprecated in favor of the `ServerCapability`).
 	JetStream bool `json:"jetstream"`
 	// Generic capability flags
-	Flags ServerCapability
+	Flags ServerCapability `json:"flags"`
 	// Sequence and Time from the remote server for this message.
 	Seq  uint64    `json:"seq"`
 	Time time.Time `json:"time"`
@@ -1191,6 +1227,17 @@ func (s *Server) initEventTracking() {
 	if _, err := s.sysSubscribe(subject, s.noInlineCallback(s.reloadConfig)); err != nil {
 		s.Errorf("Error setting up server reload handler: %v", err)
 	}
+
+	// Client connection kick
+	subject = fmt.Sprintf(clientKickReqSubj, s.info.ID)
+	if _, err := s.sysSubscribe(subject, s.noInlineCallback(s.kickClient)); err != nil {
+		s.Errorf("Error setting up client kick service: %v", err)
+	}
+	// Client connection LDM
+	subject = fmt.Sprintf(clientLDMReqSubj, s.info.ID)
+	if _, err := s.sysSubscribe(subject, s.noInlineCallback(s.ldmClient)); err != nil {
+		s.Errorf("Error setting up client LDM service: %v", err)
+	}
 }
 
 // UserInfo returns basic information to a user about bound account and user permissions.
@@ -1898,7 +1945,7 @@ func (s *Server) registerSystemImports(a *Account) {
 		return
 	}
 	sacc := s.SystemAccount()
-	if sacc == nil {
+	if sacc == nil || sacc == a {
 		return
 	}
 	// FIXME(dlc) - make a shared list between sys exports etc.
@@ -2006,7 +2053,7 @@ func (s *Server) sendAccConnsUpdate(a *Account, subj ...string) {
 	a.mu.Unlock()
 }
 
-// Lock shoulc be held on entry
+// Lock should be held on entry.
 func (a *Account) statz() *AccountStat {
 	localConns := a.numLocalConnections()
 	leafConns := a.numLocalLeafNodes()
@@ -2018,10 +2065,12 @@ func (a *Account) statz() *AccountStat {
 		NumSubs:    a.sl.Count(),
 		Received: DataStats{
 			Msgs:  atomic.LoadInt64(&a.inMsgs),
-			Bytes: atomic.LoadInt64(&a.inBytes)},
+			Bytes: atomic.LoadInt64(&a.inBytes),
+		},
 		Sent: DataStats{
 			Msgs:  atomic.LoadInt64(&a.outMsgs),
-			Bytes: atomic.LoadInt64(&a.outBytes)},
+			Bytes: atomic.LoadInt64(&a.outBytes),
+		},
 		SlowConsumers: atomic.LoadInt64(&a.slowConsumers),
 	}
 }
@@ -2675,6 +2724,49 @@ func (s *Server) reloadConfig(sub *subscription, c *client, _ *Account, subject,
 	})
 }
 
+type KickClientReq struct {
+	CID uint64 `json:"cid"`
+}
+
+type LDMClientReq struct {
+	CID uint64 `json:"cid"`
+}
+
+func (s *Server) kickClient(_ *subscription, c *client, _ *Account, subject, reply string, hdr, msg []byte) {
+	if !s.eventsRunning() {
+		return
+	}
+
+	var req KickClientReq
+	if err := json.Unmarshal(msg, &req); err != nil {
+		s.sys.client.Errorf("Error unmarshalling kick client request: %v", err)
+		return
+	}
+
+	optz := &EventFilterOptions{}
+	s.zReq(c, reply, hdr, msg, optz, optz, func() (interface{}, error) {
+		return nil, s.DisconnectClientByID(req.CID)
+	})
+
+}
+
+func (s *Server) ldmClient(_ *subscription, c *client, _ *Account, subject, reply string, hdr, msg []byte) {
+	if !s.eventsRunning() {
+		return
+	}
+
+	var req LDMClientReq
+	if err := json.Unmarshal(msg, &req); err != nil {
+		s.sys.client.Errorf("Error unmarshalling kick client request: %v", err)
+		return
+	}
+
+	optz := &EventFilterOptions{}
+	s.zReq(c, reply, hdr, msg, optz, optz, func() (interface{}, error) {
+		return nil, s.LDMClientByID(req.CID)
+	})
+}
+
 // Helper to grab account name for a client.
 func accForClient(c *client) string {
 	if c.acc != nil {
@@ -2715,4 +2807,75 @@ func (s *Server) wrapChk(f func()) func() {
 		f()
 		s.mu.Unlock()
 	}
+}
+
+// sendOCSPPeerRejectEvent sends a system level event to system account when a peer connection is
+// rejected due to OCSP invalid status of its trust chain(s).
+func (s *Server) sendOCSPPeerRejectEvent(kind string, peer *x509.Certificate, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.eventsEnabled() {
+		return
+	}
+	if peer == nil {
+		s.Errorf(certidp.ErrPeerEmptyNoEvent)
+		return
+	}
+	eid := s.nextEventID()
+	now := time.Now().UTC()
+	m := OCSPPeerRejectEventMsg{
+		TypedEvent: TypedEvent{
+			Type: OCSPPeerRejectEventMsgType,
+			ID:   eid,
+			Time: now,
+		},
+		Kind: kind,
+		Peer: certidp.CertInfo{
+			Subject:     certidp.GetSubjectDNForm(peer),
+			Issuer:      certidp.GetIssuerDNForm(peer),
+			Fingerprint: certidp.GenerateFingerprint(peer),
+			Raw:         peer.Raw,
+		},
+		Reason: reason,
+	}
+	subj := fmt.Sprintf(ocspPeerRejectEventSubj, s.info.ID)
+	s.sendInternalMsg(subj, _EMPTY_, &m.Server, &m)
+}
+
+// sendOCSPPeerChainlinkInvalidEvent sends a system level event to system account when a link in a peer's trust chain
+// is OCSP invalid.
+func (s *Server) sendOCSPPeerChainlinkInvalidEvent(peer *x509.Certificate, link *x509.Certificate, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.eventsEnabled() {
+		return
+	}
+	if peer == nil || link == nil {
+		s.Errorf(certidp.ErrPeerEmptyNoEvent)
+		return
+	}
+	eid := s.nextEventID()
+	now := time.Now().UTC()
+	m := OCSPPeerChainlinkInvalidEventMsg{
+		TypedEvent: TypedEvent{
+			Type: OCSPPeerChainlinkInvalidEventMsgType,
+			ID:   eid,
+			Time: now,
+		},
+		Link: certidp.CertInfo{
+			Subject:     certidp.GetSubjectDNForm(link),
+			Issuer:      certidp.GetIssuerDNForm(link),
+			Fingerprint: certidp.GenerateFingerprint(link),
+			Raw:         link.Raw,
+		},
+		Peer: certidp.CertInfo{
+			Subject:     certidp.GetSubjectDNForm(peer),
+			Issuer:      certidp.GetIssuerDNForm(peer),
+			Fingerprint: certidp.GenerateFingerprint(peer),
+			Raw:         peer.Raw,
+		},
+		Reason: reason,
+	}
+	subj := fmt.Sprintf(ocspPeerChainlinkInvalidEventSubj, s.info.ID)
+	s.sendInternalMsg(subj, _EMPTY_, &m.Server, &m)
 }

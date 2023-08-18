@@ -2300,9 +2300,13 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 
 		case isLeader = <-lch:
 			if isLeader {
-				if sendSnapshot && mset != nil && n != nil {
-					n.SendSnapshot(mset.stateSnapshot())
-					sendSnapshot = false
+				if mset != nil && n != nil {
+					// Send a snapshot if being asked or if we are tracking
+					// a failed state so that followers sync.
+					if clfs := mset.clearCLFS(); clfs > 0 || sendSnapshot {
+						n.SendSnapshot(mset.stateSnapshot())
+						sendSnapshot = false
+					}
 				}
 				if isRestore {
 					acc, _ := s.LookupAccount(sa.Client.serviceAccount())
@@ -2723,15 +2727,14 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 
 				// Grab last sequence and CLFS.
 				last, clfs := mset.lastSeqAndCLFS()
-
 				// We can skip if we know this is less than what we already have.
 				if lseq-clfs < last {
 					s.Debugf("Apply stream entries for '%s > %s' skipping message with sequence %d with last of %d",
 						mset.account(), mset.name(), lseq+1-clfs, last)
-					// Check for any preAcks in case we are interest based.
+
 					mset.mu.Lock()
-					seq := lseq + 1 - mset.clfs
-					mset.clearAllPreAcks(seq)
+					// Check for any preAcks in case we are interest based.
+					mset.clearAllPreAcks(lseq + 1 - mset.clfs)
 					mset.mu.Unlock()
 					continue
 				}
@@ -2817,12 +2820,15 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					}
 					panic(err.Error())
 				}
-				// Ignore if we are recovering and we have already processed.
-				if isRecovering && (sp.Request == nil || sp.Request.Sequence == 0) {
+				// If no explicit request, fill in with leader stamped last sequence to protect ourselves on replay during server start.
+				if sp.Request == nil || sp.Request.Sequence == 0 {
+					purgeSeq := sp.LastSeq + 1
 					if sp.Request == nil {
-						sp.Request = &JSApiStreamPurgeRequest{Sequence: sp.LastSeq}
-					} else {
-						sp.Request.Sequence = sp.LastSeq
+						sp.Request = &JSApiStreamPurgeRequest{Sequence: purgeSeq}
+					} else if sp.Request.Keep == 0 {
+						sp.Request.Sequence = purgeSeq
+					} else if isRecovering {
+						continue
 					}
 				}
 
@@ -4052,7 +4058,7 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment, state 
 	var didCreate, isConfigUpdate, needsLocalResponse bool
 	if o == nil {
 		// Add in the consumer if needed.
-		if o, err = mset.addConsumerWithAssignment(ca.Config, ca.Name, ca, false); err == nil {
+		if o, err = mset.addConsumerWithAssignment(ca.Config, ca.Name, ca, false, ActionCreateOrUpdate); err == nil {
 			didCreate = true
 		}
 	} else {
@@ -6787,7 +6793,7 @@ func (cc *jetStreamCluster) createGroupForConsumer(cfg *ConsumerConfig, sa *stre
 }
 
 // jsClusteredConsumerRequest is first point of entry to create a consumer with R > 1.
-func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subject, reply string, rmsg []byte, stream string, cfg *ConsumerConfig) {
+func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subject, reply string, rmsg []byte, stream string, cfg *ConsumerConfig, action ConsumerAction) {
 	js, cc := s.getJetStreamCluster()
 	if js == nil || cc == nil {
 		return
@@ -6888,6 +6894,11 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 			oname = cfg.Durable
 		}
 		if ca = sa.consumers[oname]; ca != nil && !ca.deleted {
+			if action == ActionCreate && !reflect.DeepEqual(cfg, ca.Config) {
+				resp.Error = NewJSConsumerAlreadyExistsError()
+				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+				return
+			}
 			// Do quick sanity check on new cfg to prevent here if possible.
 			if err := acc.checkNewConsumerConfig(ca.Config, cfg); err != nil {
 				resp.Error = NewJSConsumerCreateError(err, Unless(err))
@@ -6899,6 +6910,11 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 
 	// If this is new consumer.
 	if ca == nil {
+		if action == ActionUpdate {
+			resp.Error = NewJSConsumerDoesNotExistError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+			return
+		}
 		rg := cc.createGroupForConsumer(cfg, sa)
 		if rg == nil {
 			resp.Error = NewJSInsufficientResourcesError()
@@ -6964,7 +6980,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	} else {
 		nca := ca.copyGroup()
 
-		rBefore := ca.Config.replicas(sa.Config)
+		rBefore := nca.Config.replicas(sa.Config)
 		rAfter := cfg.replicas(sa.Config)
 
 		var curLeader string

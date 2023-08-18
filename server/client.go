@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/s2"
+
 	"github.com/nats-io/jwt/v2"
 )
 
@@ -212,6 +213,7 @@ const (
 	DuplicateServerName
 	MinimumVersionRequired
 	ClusterNamesIdentical
+	Kicked
 )
 
 // Some flags passed to processMsgResults
@@ -1722,8 +1724,18 @@ func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) boo
 		return true
 	}
 
-	// Slow consumer here..
+	// Aggregate slow consumers.
 	atomic.AddInt64(&c.srv.slowConsumers, 1)
+	switch c.kind {
+	case CLIENT:
+		c.srv.scStats.clients.Add(1)
+	case ROUTER:
+		c.srv.scStats.routes.Add(1)
+	case GATEWAY:
+		c.srv.scStats.gateways.Add(1)
+	case LEAF:
+		c.srv.scStats.leafs.Add(1)
+	}
 	if c.acc != nil {
 		atomic.AddInt64(&c.acc.slowConsumers, 1)
 	}
@@ -2223,7 +2235,10 @@ func (c *client) queueOutbound(data []byte) {
 		// Perf wise, it looks like it is faster to optimistically add than
 		// checking current pb+len(data) and then add to pb.
 		c.out.pb -= int64(len(data))
+
+		// Increment the total and client's slow consumer counters.
 		atomic.AddInt64(&c.srv.slowConsumers, 1)
+		c.srv.scStats.clients.Add(1)
 		if c.acc != nil {
 			atomic.AddInt64(&c.acc.slowConsumers, 1)
 		}
@@ -3843,14 +3858,16 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	// Go back to the sublist data structure.
 	if !ok {
 		r = acc.sl.Match(string(c.pa.subject))
-		c.in.results[string(c.pa.subject)] = r
-		// Prune the results cache. Keeps us from unbounded growth. Random delete.
-		if len(c.in.results) > maxResultCacheSize {
-			n := 0
-			for subject := range c.in.results {
-				delete(c.in.results, subject)
-				if n++; n > pruneSize {
-					break
+		if len(r.psubs)+len(r.qsubs) > 0 {
+			c.in.results[string(c.pa.subject)] = r
+			// Prune the results cache. Keeps us from unbounded growth. Random delete.
+			if len(c.in.results) > maxResultCacheSize {
+				n := 0
+				for subject := range c.in.results {
+					delete(c.in.results, subject)
+					if n++; n > pruneSize {
+						break
+					}
 				}
 			}
 		}

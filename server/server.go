@@ -122,6 +122,7 @@ type Server struct {
 	// How often user logon fails due to the issuer account not being pinned.
 	pinnedAccFail uint64
 	stats
+	scStats
 	mu                  sync.RWMutex
 	kp                  nkeys.KeyPair
 	xkp                 nkeys.KeyPair
@@ -262,6 +263,12 @@ type Server struct {
 	// OCSP monitoring
 	ocsps []*OCSPMonitor
 
+	// OCSP peer verification (at least one TLS block)
+	ocspPeerVerify bool
+
+	// OCSP response cache
+	ocsprc OCSPResponseCache
+
 	// exporting account name the importer experienced issues with
 	incompleteAccExporterMap sync.Map
 
@@ -330,6 +337,14 @@ type stats struct {
 	inBytes       int64
 	outBytes      int64
 	slowConsumers int64
+}
+
+// scStats includes the total and per connection counters of Slow Consumers.
+type scStats struct {
+	clients  atomic.Uint64
+	routes   atomic.Uint64
+	leafs    atomic.Uint64
+	gateways atomic.Uint64
 }
 
 // This is used by tests so we can run all server tests with a default route
@@ -714,8 +729,8 @@ func NewServer(opts *Options) (*Server, error) {
 	// Ensure that non-exported options (used in tests) are properly set.
 	s.setLeafNodeNonExportedOptions()
 
-	// Setup OCSP Stapling. This will abort server from starting if there
-	// are no valid staples and OCSP policy is set to Always or MustStaple.
+	// Setup OCSP Stapling and OCSP Peer. This will abort server from starting if there
+	// are no valid staples and OCSP Stapling policy is set to Always or MustStaple.
 	if err := s.enableOCSP(); err != nil {
 		return nil, err
 	}
@@ -1106,7 +1121,7 @@ func (s *Server) configureAccounts(reloading bool) (map[string]struct{}, error) 
 			a.mu.Lock()
 			acc.shallowCopy(a)
 			a.mu.Unlock()
-			// Will be a no-op in case of the global account since it is alrady registered.
+			// Will be a no-op in case of the global account since it is already registered.
 			s.registerAccountNoLock(a)
 		}
 		// The `acc` account is stored in options, not in the server, and these can be cleared.
@@ -1196,6 +1211,9 @@ func (s *Server) configureAccounts(reloading bool) (map[string]struct{}, error) 
 			c.processUnsub(sid)
 		}
 		acc.addAllServiceImportSubs()
+		s.mu.Unlock()
+		s.registerSystemImports(acc)
+		s.mu.Lock()
 	}
 
 	// Set the system account if it was configured.
@@ -1208,10 +1226,6 @@ func (s *Server) configureAccounts(reloading bool) (map[string]struct{}, error) 
 		if err == nil && s.sys != nil && acc != s.sys.account {
 			// sys.account.clients (including internal client)/respmap/etc... are transferred separately
 			s.sys.account = acc
-			s.mu.Unlock()
-			// acquires server lock separately
-			s.addSystemAccountExports(acc)
-			s.mu.Lock()
 		}
 		if err != nil {
 			return awcsti, fmt.Errorf("error resolving system account: %v", err)
@@ -1239,6 +1253,13 @@ func (s *Server) configureAccounts(reloading bool) (map[string]struct{}, error) 
 			opts.Users = append(opts.Users, &User{Username: uname, Password: uname[6:], Account: s.gacc})
 			opts.NoAuthUser = uname
 		}
+	}
+
+	// Add any required exports from system account.
+	if s.sys != nil {
+		s.mu.Unlock()
+		s.addSystemAccountExports(s.sys.account)
+		s.mu.Lock()
 	}
 
 	return awcsti, nil
@@ -2234,8 +2255,12 @@ func (s *Server) Start() {
 		}
 	}
 
-	// Start OCSP Stapling monitoring for TLS certificates if enabled.
+	// Start OCSP Stapling monitoring for TLS certificates if enabled. Hook TLS handshake for
+	// OCSP check on peers (LEAF and CLIENT kind) if enabled.
 	s.startOCSPMonitoring()
+
+	// Configure OCSP Response Cache for peer OCSP checks if enabled.
+	s.initOCSPResponseCache()
 
 	// Start up gateway if needed. Do this before starting the routes, because
 	// we want to resolve the gateway host:port so that this information can
@@ -2303,6 +2328,9 @@ func (s *Server) Start() {
 	if !opts.DontListen {
 		s.AcceptLoop(clientListenReady)
 	}
+
+	// Bring OSCP Response cache online after accept loop started in anticipation of NATS-enabled cache types
+	s.startOCSPResponseCache()
 }
 
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
@@ -2465,6 +2493,12 @@ func (s *Server) Shutdown() {
 	}
 
 	s.Noticef("Server Exiting..")
+
+	// Stop OCSP Response Cache
+	if s.ocsprc != nil {
+		s.ocsprc.Stop(s)
+	}
+
 	// Close logger if applicable. It allows tests on Windows
 	// to be able to do proper cleanup (delete log file).
 	s.logging.RLock()
@@ -2659,9 +2693,6 @@ func (s *Server) StartProfiler() {
 	}
 	s.profiler = l
 	s.profilingServer = srv
-
-	// Enable blocking profile
-	runtime.SetBlockProfileRate(1)
 
 	go func() {
 		// if this errors out, it's probably because the server is being shutdown
@@ -3385,6 +3416,26 @@ func (s *Server) numSubscriptions() uint32 {
 // NumSlowConsumers will report the number of slow consumers.
 func (s *Server) NumSlowConsumers() int64 {
 	return atomic.LoadInt64(&s.slowConsumers)
+}
+
+// NumSlowConsumersClients will report the number of slow consumers clients.
+func (s *Server) NumSlowConsumersClients() uint64 {
+	return s.scStats.clients.Load()
+}
+
+// NumSlowConsumersRoutes will report the number of slow consumers routes.
+func (s *Server) NumSlowConsumersRoutes() uint64 {
+	return s.scStats.routes.Load()
+}
+
+// NumSlowConsumersGateways will report the number of slow consumers leafs.
+func (s *Server) NumSlowConsumersGateways() uint64 {
+	return s.scStats.gateways.Load()
+}
+
+// NumSlowConsumersLeafs will report the number of slow consumers leafs.
+func (s *Server) NumSlowConsumersLeafs() uint64 {
+	return s.scStats.leafs.Load()
 }
 
 // ConfigTime will report the last time the server configuration was loaded.
@@ -4197,4 +4248,37 @@ func (s *Server) changeRateLimitLogInterval(d time.Duration) {
 	case s.rateLimitLoggingCh <- d:
 	default:
 	}
+}
+
+// DisconnectClientByID disconnects a client by connection ID
+func (s *Server) DisconnectClientByID(id uint64) error {
+	client := s.clients[id]
+	if client != nil {
+		client.closeConnection(Kicked)
+		return nil
+	}
+	return errors.New("no such client id")
+}
+
+// LDMClientByID sends a Lame Duck Mode info message to a client by connection ID
+func (s *Server) LDMClientByID(id uint64) error {
+	info := s.copyInfo()
+	info.LameDuckMode = true
+
+	c := s.clients[id]
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.opts.Protocol >= ClientProtoInfo &&
+			c.flags.isSet(firstPongSent) {
+			// sendInfo takes care of checking if the connection is still
+			// valid or not, so don't duplicate tests here.
+			c.Debugf("sending Lame Duck Mode info to client")
+			c.enqueueProto(c.generateClientInfoJSON(info))
+			return nil
+		} else {
+			return errors.New("ClientProtoInfo < ClientOps.Protocol or first pong not sent")
+		}
+	}
+	return errors.New("no such client id")
 }

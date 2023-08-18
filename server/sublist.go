@@ -48,7 +48,7 @@ const (
 	// cacheMax is used to bound limit the frontend cache
 	slCacheMax = 1024
 	// If we run a sweeper we will drain to this count.
-	slCacheSweep = 512
+	slCacheSweep = 256
 	// plistMin is our lower bounds to create a fast plist for Match.
 	plistMin = 256
 )
@@ -1142,6 +1142,9 @@ func isValidLiteralSubject(tokens []string) bool {
 
 // ValidateMappingDestination returns nil error if the subject is a valid subject mapping destination subject
 func ValidateMappingDestination(subject string) error {
+	if subject == _EMPTY_ {
+		return nil
+	}
 	subjectTokens := strings.Split(subject, tsep)
 	sfwc := false
 	for _, t := range subjectTokens {

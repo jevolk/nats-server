@@ -3462,10 +3462,14 @@ func TestJetStreamConsumerRateLimit(t *testing.T) {
 		nc.Publish(mname, msg)
 	}
 	nc.Flush()
-	state := mset.state()
-	if state.Msgs != uint64(toSend) {
-		t.Fatalf("Expected %d messages, got %d", toSend, state.Msgs)
-	}
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		state := mset.state()
+		if state.Msgs != uint64(toSend) {
+			return fmt.Errorf("Expected %d messages, got %d", toSend, state.Msgs)
+		}
+		return nil
+	})
 
 	// 100Mbit
 	rateLimit := uint64(100 * 1024 * 1024)
@@ -11431,13 +11435,13 @@ func TestJetStreamMirrorBasics(t *testing.T) {
 	// Clear subjects.
 	cfg.Subjects = nil
 
-	// Source
+	// Mirrored
 	scfg := &nats.StreamConfig{
 		Name:     "S1",
 		Subjects: []string{"foo", "bar", "baz"},
 	}
 
-	// Create source stream
+	// Create mirrored stream
 	createStreamOk(scfg)
 
 	// Now create our mirror stream.
@@ -11467,7 +11471,7 @@ func TestJetStreamMirrorBasics(t *testing.T) {
 		return nil
 	})
 
-	// Purge the source stream.
+	// Purge the mirrored stream.
 	if err := js.PurgeStream("S1"); err != nil {
 		t.Fatalf("Unexpected purge error: %v", err)
 	}
@@ -11547,6 +11551,101 @@ func TestJetStreamMirrorBasics(t *testing.T) {
 		}
 		return nil
 	})
+
+	// Test subject filtering and transformation
+	createStreamServerStreamConfig := func(cfg *StreamConfig, errToCheck uint16) {
+		t.Helper()
+		req, err := json.Marshal(cfg)
+		require_NoError(t, err)
+
+		rm, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+		require_NoError(t, err)
+
+		var resp JSApiStreamCreateResponse
+		if err := json.Unmarshal(rm.Data, &resp); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+		if errToCheck == 0 {
+			if resp.Error != nil {
+				t.Fatalf("Unexpected error: %+v", resp.Error)
+			}
+		} else {
+			if resp.Error.ErrCode != errToCheck {
+				t.Fatalf("Expected error %+v, got: %+v", errToCheck, resp.Error)
+			}
+		}
+	}
+
+	// check for errors
+	createStreamServerStreamConfig(&StreamConfig{
+		Name:    "MBAD",
+		Storage: FileStorage,
+		Mirror:  &StreamSource{Name: "S1", FilterSubject: "foo", SubjectTransforms: []SubjectTransformConfig{{Source: "foo", Destination: "foo3"}}},
+	}, ApiErrors[JSMirrorMultipleFiltersNotAllowed].ErrCode)
+
+	createStreamServerStreamConfig(&StreamConfig{
+		Name:    "MBAD",
+		Storage: FileStorage,
+		Mirror:  &StreamSource{Name: "S1", SubjectTransforms: []SubjectTransformConfig{{Source: ".*.", Destination: "foo3"}}},
+	}, ApiErrors[JSMirrorInvalidSubjectFilter].ErrCode)
+
+	createStreamServerStreamConfig(&StreamConfig{
+		Name:    "MBAD",
+		Storage: FileStorage,
+		Mirror:  &StreamSource{Name: "S1", SubjectTransforms: []SubjectTransformConfig{{Source: "*", Destination: "{{wildcard(2)}}"}}},
+	}, ApiErrors[JSStreamCreateErrF].ErrCode)
+
+	createStreamServerStreamConfig(&StreamConfig{
+		Name:    "MBAD",
+		Storage: FileStorage,
+		Mirror:  &StreamSource{Name: "S1", SubjectTransforms: []SubjectTransformConfig{{Source: "foo", Destination: ""}, {Source: "foo", Destination: "bar"}}},
+	}, ApiErrors[JSMirrorOverlappingSubjectFilters].ErrCode)
+
+	createStreamServerStreamConfig(&StreamConfig{
+		Name:    "M5",
+		Storage: FileStorage,
+		Mirror:  &StreamSource{Name: "S1", FilterSubject: "foo", SubjectTransformDest: "foo2"},
+	}, 0)
+
+	createStreamServerStreamConfig(&StreamConfig{
+		Name:    "M6",
+		Storage: FileStorage,
+		Mirror:  &StreamSource{Name: "S1", SubjectTransforms: []SubjectTransformConfig{{Source: "bar", Destination: "bar2"}, {Source: "baz", Destination: "baz2"}}},
+	}, 0)
+
+	// Send 100 messages on foo (there should already be 50 messages on bar and 100 on baz in the stream)
+	for i := 0; i < 100; i++ {
+		if _, err := js.Publish("foo", []byte("OK")); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	var f = func(streamName string, subject string, subjectNumMsgs uint64, streamNumMsg uint64, firstSeq uint64, lastSeq uint64) func() error {
+		return func() error {
+			si, err := js2.StreamInfo(streamName, &nats.StreamInfoRequest{SubjectsFilter: ">"})
+			require_NoError(t, err)
+			if ss, ok := si.State.Subjects[subject]; !ok {
+				t.Log("Expected messages with the transformed subject")
+			} else {
+				if ss != subjectNumMsgs {
+					t.Fatalf("Expected %d messages on the transformed subject but got %d", subjectNumMsgs, ss)
+				}
+			}
+			if si.State.Msgs != streamNumMsg {
+				return fmt.Errorf("Expected %d stream messages, got state: %+v", streamNumMsg, si.State)
+			}
+			if si.State.FirstSeq != firstSeq || si.State.LastSeq != lastSeq {
+				return fmt.Errorf("Expected first sequence=%d and last sequence=%d, but got state: %+v", firstSeq, lastSeq, si.State)
+			}
+			return nil
+		}
+	}
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, f("M5", "foo2", 100, 100, 251, 350))
+	checkFor(t, 2*time.Second, 100*time.Millisecond, f("M6", "bar2", 50, 150, 101, 250))
+	checkFor(t, 2*time.Second, 100*time.Millisecond, f("M6", "baz2", 100, 150, 101, 250))
+
 }
 
 func TestJetStreamMirrorUpdatePreventsSubjects(t *testing.T) {
@@ -11663,12 +11762,13 @@ func TestJetStreamSourceBasics(t *testing.T) {
 	}
 
 	// Test optional start times, filtered subjects etc.
-	if _, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"dlc", "rip"}}); err != nil {
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"dlc", "rip", "jnm"}}); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	sendBatch("dlc", 20)
 	sendBatch("rip", 20)
 	sendBatch("dlc", 10)
+	sendBatch("jnm", 10)
 
 	cfg = &StreamConfig{
 		Name:    "FMS",
@@ -11681,8 +11781,8 @@ func TestJetStreamSourceBasics(t *testing.T) {
 	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
 		si, err := js2.StreamInfo("FMS")
 		require_NoError(t, err)
-		if si.State.Msgs != 25 {
-			return fmt.Errorf("Expected 25 msgs, got state: %+v", si.State)
+		if si.State.Msgs != 35 {
+			return fmt.Errorf("Expected 35 msgs, got state: %+v", si.State)
 		}
 		return nil
 	})
@@ -11700,7 +11800,7 @@ func TestJetStreamSourceBasics(t *testing.T) {
 		Name:    "FMS2",
 		Storage: FileStorage,
 		Sources: []*StreamSource{
-			{Name: "TEST", OptStartSeq: 11, FilterSubject: "dlc"},
+			{Name: "TEST", OptStartSeq: 11, FilterSubject: "dlc", SubjectTransformDest: "dlc2"},
 		},
 	}
 	createStream(cfg)
@@ -11722,6 +11822,56 @@ func TestJetStreamSourceBasics(t *testing.T) {
 	} else if _, _, sseq := streamAndSeq(shdr); sseq != 11 {
 		t.Fatalf("Expected header sequence of 11, got %d", sseq)
 	}
+	if m.Subject != "dlc2" {
+		t.Fatalf("Expected transformed subject dlc2, but got %s instead", m.Subject)
+	}
+
+	// Test Filters
+	cfg = &StreamConfig{
+		Name:    "FMS3",
+		Storage: FileStorage,
+		Sources: []*StreamSource{
+			{Name: "TEST", SubjectTransforms: []SubjectTransformConfig{{Source: "dlc", Destination: "dlc2"}, {Source: "rip", Destination: ""}}},
+		},
+	}
+	createStream(cfg)
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("FMS3")
+		require_NoError(t, err)
+		if si.State.Msgs != 50 {
+			return fmt.Errorf("Expected 50 msgs, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	// Double check first message
+	if m, err = js.GetMsg("FMS3", 1); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if shdr := m.Header.Get(JSStreamSource); shdr == _EMPTY_ {
+		t.Fatalf("Expected a header, got none")
+	} else if m.Subject != "dlc2" {
+		t.Fatalf("Expected subject 'dlc2' and got %s", m.Subject)
+	}
+
+	// Double check first message with the other subject
+	if m, err = js.GetMsg("FMS3", 21); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if shdr := m.Header.Get(JSStreamSource); shdr == _EMPTY_ {
+		t.Fatalf("Expected a header, got none")
+	} else if m.Subject != "rip" {
+		t.Fatalf("Expected subject 'rip' and got %s", m.Subject)
+	}
+
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js2.StreamInfo("FMS3")
+		require_NoError(t, err)
+		if si.State.Subjects["jnm"] != 0 {
+			return fmt.Errorf("Unexpected messages from the source found")
+		}
+		return nil
+	})
 }
 
 func TestJetStreamInputTransform(t *testing.T) {
@@ -21351,4 +21501,114 @@ func TestJetStreamServerReencryption(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestJetStreamLimitsToInterestPolicy(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+
+	// This is the index of the consumer that we'll create as R1
+	// instead of R3, just to prove that it blocks the stream
+	// update from happening properly.
+	singleReplica := 3
+
+	streamCfg := nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.LimitsPolicy,
+		Storage:   nats.MemoryStorage,
+		Replicas:  3,
+	}
+
+	stream, err := js.AddStream(&streamCfg)
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		replicas := streamCfg.Replicas
+		if i == singleReplica {
+			// Make one of the consumers R1 so that we can check
+			// that the switch to interest-based retention is also
+			// turning it into an R3 consumer.
+			replicas = 1
+		}
+		cname := fmt.Sprintf("test_%d", i)
+		_, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Name:      cname,
+			Durable:   cname,
+			AckPolicy: nats.AckAllPolicy,
+			Replicas:  replicas,
+		})
+		require_NoError(t, err)
+	}
+
+	for i := 0; i < 20; i++ {
+		_, err := js.Publish("foo", []byte{1, 2, 3, 4, 5})
+		require_NoError(t, err)
+	}
+
+	// Pull 10 or more messages from the stream. We will never pull
+	// less than 10, which guarantees that the lowest ack floor of
+	// all consumers should be 10.
+	for i := 0; i < 10; i++ {
+		cname := fmt.Sprintf("test_%d", i)
+		count := 10 + i // At least 10 messages
+
+		sub, err := js.PullSubscribe("foo", cname)
+		require_NoError(t, err)
+
+		msgs, err := sub.Fetch(count)
+		require_NoError(t, err)
+		require_Equal(t, len(msgs), count)
+		require_NoError(t, msgs[len(msgs)-1].AckSync())
+
+		// At this point the ack floor should match the count of
+		// messages we received.
+		info, err := js.ConsumerInfo("TEST", cname)
+		require_NoError(t, err)
+		require_Equal(t, info.AckFloor.Consumer, uint64(count))
+	}
+
+	// Try updating to interest-based. This should fail because
+	// we have a consumer that is R1 on an R3 stream.
+	streamCfg = stream.Config
+	streamCfg.Retention = nats.InterestPolicy
+	_, err = js.UpdateStream(&streamCfg)
+	require_Error(t, err)
+
+	// Now we'll make the R1 consumer an R3.
+	cname := fmt.Sprintf("test_%d", singleReplica)
+	cinfo, err := js.ConsumerInfo("TEST", cname)
+	require_NoError(t, err)
+
+	cinfo.Config.Replicas = streamCfg.Replicas
+	_, _ = js.UpdateConsumer("TEST", &cinfo.Config)
+	// TODO(nat): The jsConsumerCreateRequest update doesn't always
+	// respond when there are no errors updating a consumer, so this
+	// nearly always returns a timeout, despite actually doing what
+	// it should. We'll make sure the replicas were updated by doing
+	// another consumer info just to be sure.
+	// require_NoError(t, err)
+	c.waitOnAllCurrent()
+	cinfo, err = js.ConsumerInfo("TEST", cname)
+	require_NoError(t, err)
+	require_Equal(t, cinfo.Config.Replicas, streamCfg.Replicas)
+	require_Equal(t, len(cinfo.Cluster.Replicas), streamCfg.Replicas-1)
+
+	// This time it should succeed.
+	_, err = js.UpdateStream(&streamCfg)
+	require_NoError(t, err)
+
+	// We need to wait for all nodes to have applied the new stream
+	// configuration.
+	c.waitOnAllCurrent()
+
+	// Now we should only have 10 messages left in the stream, as
+	// each consumer has acked at least the first 10 messages.
+	info, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, info.State.FirstSeq, 11)
+	require_Equal(t, info.State.Msgs, 10)
 }

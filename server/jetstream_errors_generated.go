@@ -44,6 +44,9 @@ const (
 	// JSClusterUnSupportFeatureErr not currently supported in clustered mode
 	JSClusterUnSupportFeatureErr ErrorIdentifier = 10036
 
+	// JSConsumerAlreadyExists action CREATE is used for a existing consumer with a different config (consumer already exists)
+	JSConsumerAlreadyExists ErrorIdentifier = 10148
+
 	// JSConsumerBadDurableNameErr durable name can not contain '.', '*', '>'
 	JSConsumerBadDurableNameErr ErrorIdentifier = 10103
 
@@ -73,6 +76,9 @@ const (
 
 	// JSConsumerDirectRequiresPushErr consumer direct requires a push based consumer
 	JSConsumerDirectRequiresPushErr ErrorIdentifier = 10090
+
+	// JSConsumerDoesNotExist action UPDATE is used for a nonexisting consumer (consumer does not exist)
+	JSConsumerDoesNotExist ErrorIdentifier = 10149
 
 	// JSConsumerDuplicateFilterSubjects consumer cannot have both FilterSubject and FilterSubjects specified
 	JSConsumerDuplicateFilterSubjects ErrorIdentifier = 10136
@@ -227,8 +233,17 @@ const (
 	// JSMirrorInvalidStreamName mirrored stream name is invalid
 	JSMirrorInvalidStreamName ErrorIdentifier = 10142
 
+	// JSMirrorInvalidSubjectFilter mirror subject filter is invalid
+	JSMirrorInvalidSubjectFilter ErrorIdentifier = 10151
+
 	// JSMirrorMaxMessageSizeTooBigErr stream mirror must have max message size >= source
 	JSMirrorMaxMessageSizeTooBigErr ErrorIdentifier = 10030
+
+	// JSMirrorMultipleFiltersNotAllowed mirror with multiple subject transforms cannot also have a single subject filter
+	JSMirrorMultipleFiltersNotAllowed ErrorIdentifier = 10150
+
+	// JSMirrorOverlappingSubjectFilters mirror subject filters can not overlap
+	JSMirrorOverlappingSubjectFilters ErrorIdentifier = 10152
 
 	// JSMirrorWithFirstSeqErr stream mirrors can not have first sequence configured
 	JSMirrorWithFirstSeqErr ErrorIdentifier = 10143
@@ -290,8 +305,20 @@ const (
 	// JSSourceInvalidStreamName sourced stream name is invalid
 	JSSourceInvalidStreamName ErrorIdentifier = 10141
 
+	// JSSourceInvalidSubjectFilter source subject filter is invalid
+	JSSourceInvalidSubjectFilter ErrorIdentifier = 10145
+
+	// JSSourceInvalidTransformDestination source transform destination is invalid
+	JSSourceInvalidTransformDestination ErrorIdentifier = 10146
+
 	// JSSourceMaxMessageSizeTooBigErr stream source must have max message size >= target
 	JSSourceMaxMessageSizeTooBigErr ErrorIdentifier = 10046
+
+	// JSSourceMultipleFiltersNotAllowed source with multiple subject transforms cannot also have a single subject filter
+	JSSourceMultipleFiltersNotAllowed ErrorIdentifier = 10144
+
+	// JSSourceOverlappingSubjectFilters source filters can not overlap
+	JSSourceOverlappingSubjectFilters ErrorIdentifier = 10147
 
 	// JSStorageResourcesExceededErr insufficient storage resources available
 	JSStorageResourcesExceededErr ErrorIdentifier = 10047
@@ -447,6 +474,7 @@ var (
 		JSClusterServerNotMemberErr:                {Code: 400, ErrCode: 10044, Description: "server is not a member of the cluster"},
 		JSClusterTagsErr:                           {Code: 400, ErrCode: 10011, Description: "tags placement not supported for operation"},
 		JSClusterUnSupportFeatureErr:               {Code: 503, ErrCode: 10036, Description: "not currently supported in clustered mode"},
+		JSConsumerAlreadyExists:                    {Code: 400, ErrCode: 10148, Description: "consumer already exists"},
 		JSConsumerBadDurableNameErr:                {Code: 400, ErrCode: 10103, Description: "durable name can not contain '.', '*', '>'"},
 		JSConsumerConfigRequiredErr:                {Code: 400, ErrCode: 10078, Description: "consumer config required"},
 		JSConsumerCreateDurableAndNameMismatch:     {Code: 400, ErrCode: 10132, Description: "Consumer Durable and Name have to be equal if both are provided"},
@@ -457,6 +485,7 @@ var (
 		JSConsumerDescriptionTooLongErrF:           {Code: 400, ErrCode: 10107, Description: "consumer description is too long, maximum allowed is {max}"},
 		JSConsumerDirectRequiresEphemeralErr:       {Code: 400, ErrCode: 10091, Description: "consumer direct requires an ephemeral consumer"},
 		JSConsumerDirectRequiresPushErr:            {Code: 400, ErrCode: 10090, Description: "consumer direct requires a push based consumer"},
+		JSConsumerDoesNotExist:                     {Code: 400, ErrCode: 10149, Description: "consumer does not exist"},
 		JSConsumerDuplicateFilterSubjects:          {Code: 400, ErrCode: 10136, Description: "consumer cannot have both FilterSubject and FilterSubjects specified"},
 		JSConsumerDurableNameNotInSubjectErr:       {Code: 400, ErrCode: 10016, Description: "consumer expected to be durable but no durable name set in subject"},
 		JSConsumerDurableNameNotMatchSubjectErr:    {Code: 400, ErrCode: 10017, Description: "consumer name in subject does not match durable name in request"},
@@ -508,7 +537,10 @@ var (
 		JSMemoryResourcesExceededErr:               {Code: 500, ErrCode: 10028, Description: "insufficient memory resources available"},
 		JSMirrorConsumerSetupFailedErrF:            {Code: 500, ErrCode: 10029, Description: "{err}"},
 		JSMirrorInvalidStreamName:                  {Code: 400, ErrCode: 10142, Description: "mirrored stream name is invalid"},
+		JSMirrorInvalidSubjectFilter:               {Code: 400, ErrCode: 10151, Description: "mirror subject filter is invalid"},
 		JSMirrorMaxMessageSizeTooBigErr:            {Code: 400, ErrCode: 10030, Description: "stream mirror must have max message size >= source"},
+		JSMirrorMultipleFiltersNotAllowed:          {Code: 400, ErrCode: 10150, Description: "mirror with multiple subject transforms cannot also have a single subject filter"},
+		JSMirrorOverlappingSubjectFilters:          {Code: 400, ErrCode: 10152, Description: "mirror subject filters can not overlap"},
 		JSMirrorWithFirstSeqErr:                    {Code: 400, ErrCode: 10143, Description: "stream mirrors can not have first sequence configured"},
 		JSMirrorWithSourcesErr:                     {Code: 400, ErrCode: 10031, Description: "stream mirrors can not also contain other sources"},
 		JSMirrorWithStartSeqAndTimeErr:             {Code: 400, ErrCode: 10032, Description: "stream mirrors can not have both start seq and start time configured"},
@@ -529,7 +561,11 @@ var (
 		JSSourceConsumerSetupFailedErrF:            {Code: 500, ErrCode: 10045, Description: "{err}"},
 		JSSourceDuplicateDetected:                  {Code: 400, ErrCode: 10140, Description: "duplicate source configuration detected"},
 		JSSourceInvalidStreamName:                  {Code: 400, ErrCode: 10141, Description: "sourced stream name is invalid"},
+		JSSourceInvalidSubjectFilter:               {Code: 400, ErrCode: 10145, Description: "source subject filter is invalid"},
+		JSSourceInvalidTransformDestination:        {Code: 400, ErrCode: 10146, Description: "source transform destination is invalid"},
 		JSSourceMaxMessageSizeTooBigErr:            {Code: 400, ErrCode: 10046, Description: "stream source must have max message size >= target"},
+		JSSourceMultipleFiltersNotAllowed:          {Code: 400, ErrCode: 10144, Description: "source with multiple subject transforms cannot also have a single subject filter"},
+		JSSourceOverlappingSubjectFilters:          {Code: 400, ErrCode: 10147, Description: "source filters can not overlap"},
 		JSStorageResourcesExceededErr:              {Code: 500, ErrCode: 10047, Description: "insufficient storage resources available"},
 		JSStreamAssignmentErrF:                     {Code: 500, ErrCode: 10048, Description: "{err}"},
 		JSStreamCreateErrF:                         {Code: 500, ErrCode: 10049, Description: "{err}"},
@@ -737,6 +773,16 @@ func NewJSClusterUnSupportFeatureError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSClusterUnSupportFeatureErr]
 }
 
+// NewJSConsumerAlreadyExistsError creates a new JSConsumerAlreadyExists error: "consumer already exists"
+func NewJSConsumerAlreadyExistsError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerAlreadyExists]
+}
+
 // NewJSConsumerBadDurableNameError creates a new JSConsumerBadDurableNameErr error: "durable name can not contain '.', '*', '>'"
 func NewJSConsumerBadDurableNameError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -847,6 +893,16 @@ func NewJSConsumerDirectRequiresPushError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSConsumerDirectRequiresPushErr]
+}
+
+// NewJSConsumerDoesNotExistError creates a new JSConsumerDoesNotExist error: "consumer does not exist"
+func NewJSConsumerDoesNotExistError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerDoesNotExist]
 }
 
 // NewJSConsumerDuplicateFilterSubjectsError creates a new JSConsumerDuplicateFilterSubjects error: "consumer cannot have both FilterSubject and FilterSubjects specified"
@@ -1407,6 +1463,16 @@ func NewJSMirrorInvalidStreamNameError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSMirrorInvalidStreamName]
 }
 
+// NewJSMirrorInvalidSubjectFilterError creates a new JSMirrorInvalidSubjectFilter error: "mirror subject filter is invalid"
+func NewJSMirrorInvalidSubjectFilterError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorInvalidSubjectFilter]
+}
+
 // NewJSMirrorMaxMessageSizeTooBigError creates a new JSMirrorMaxMessageSizeTooBigErr error: "stream mirror must have max message size >= source"
 func NewJSMirrorMaxMessageSizeTooBigError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1415,6 +1481,26 @@ func NewJSMirrorMaxMessageSizeTooBigError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSMirrorMaxMessageSizeTooBigErr]
+}
+
+// NewJSMirrorMultipleFiltersNotAllowedError creates a new JSMirrorMultipleFiltersNotAllowed error: "mirror with multiple subject transforms cannot also have a single subject filter"
+func NewJSMirrorMultipleFiltersNotAllowedError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorMultipleFiltersNotAllowed]
+}
+
+// NewJSMirrorOverlappingSubjectFiltersError creates a new JSMirrorOverlappingSubjectFilters error: "mirror subject filters can not overlap"
+func NewJSMirrorOverlappingSubjectFiltersError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorOverlappingSubjectFilters]
 }
 
 // NewJSMirrorWithFirstSeqError creates a new JSMirrorWithFirstSeqErr error: "stream mirrors can not have first sequence configured"
@@ -1641,6 +1727,26 @@ func NewJSSourceInvalidStreamNameError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSSourceInvalidStreamName]
 }
 
+// NewJSSourceInvalidSubjectFilterError creates a new JSSourceInvalidSubjectFilter error: "source subject filter is invalid"
+func NewJSSourceInvalidSubjectFilterError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceInvalidSubjectFilter]
+}
+
+// NewJSSourceInvalidTransformDestinationError creates a new JSSourceInvalidTransformDestination error: "source transform destination is invalid"
+func NewJSSourceInvalidTransformDestinationError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceInvalidTransformDestination]
+}
+
 // NewJSSourceMaxMessageSizeTooBigError creates a new JSSourceMaxMessageSizeTooBigErr error: "stream source must have max message size >= target"
 func NewJSSourceMaxMessageSizeTooBigError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1649,6 +1755,26 @@ func NewJSSourceMaxMessageSizeTooBigError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSSourceMaxMessageSizeTooBigErr]
+}
+
+// NewJSSourceMultipleFiltersNotAllowedError creates a new JSSourceMultipleFiltersNotAllowed error: "source with multiple subject transforms cannot also have a single subject filter"
+func NewJSSourceMultipleFiltersNotAllowedError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceMultipleFiltersNotAllowed]
+}
+
+// NewJSSourceOverlappingSubjectFiltersError creates a new JSSourceOverlappingSubjectFilters error: "source filters can not overlap"
+func NewJSSourceOverlappingSubjectFiltersError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceOverlappingSubjectFilters]
 }
 
 // NewJSStorageResourcesExceededError creates a new JSStorageResourcesExceededErr error: "insufficient storage resources available"
